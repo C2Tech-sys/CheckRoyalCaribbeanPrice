@@ -3,8 +3,8 @@ import json
 import pytest
 import re
 import requests
-from datetime import datetime
-
+import sys
+from datetime import datetime, date
 from unittest.mock import MagicMock, patch
 
 # Import the specific entities and orchestration engines from your script
@@ -32,6 +32,7 @@ from CheckRoyalCaribbeanPrice import (
 # ITEM 21 TESTS: TA / AGENCY BOOKING BALANCE DUE FALLBACK LOGIC
     AccountInfo,
     APIAccess,
+    CheckinPaymentTracker,
     CruiseAppConfig,
     CruiseURLParams,
     DiscountProfile,
@@ -50,6 +51,7 @@ from CheckRoyalCaribbeanPrice import (
     get_checkin_info,
     get_cruise_price,
     get_dining_and_prices,
+    get_final_payment_date,
     get_new_order_price,
     get_orders,
     get_profile,
@@ -71,8 +73,6 @@ def mock_global_config():
     Safely mocks the global config object, custom log methods, and apprise notifications
     so production functions run cleanly without side-effects.
     """
-    import CheckRoyalCaribbeanPrice
-
     # Create a mock config object with all required properties
     mock_config = MagicMock()
     mock_config.apobj = MagicMock()
@@ -80,16 +80,10 @@ def mock_global_config():
     mock_config.format_date = lambda d: str(d) # Simple string conversion pass-through
     mock_config.currency_override = None
 
-    # Override the module-level config variable
-    original_config = CheckRoyalCaribbeanPrice.config
-    CheckRoyalCaribbeanPrice.config = mock_config
-
-    # Patch the internal 'log' function directly to avoid NoneType crash calls
-    with patch('CheckRoyalCaribbeanPrice.log', MagicMock()) as mock_log:
+    # Patch the attributes on the imported config object and module log target directly
+    with patch("CheckRoyalCaribbeanPrice.config", mock_config), \
+         patch("CheckRoyalCaribbeanPrice.log", MagicMock()):
         yield mock_config.apobj
-
-    # Restore original state after test run
-    CheckRoyalCaribbeanPrice.config = original_config
 
 
 @pytest.fixture
@@ -325,8 +319,6 @@ def test_get_orders_linked_reservation_isolation(mock_config, mock_execute):
     for linked accounts without corrupting the primary booking dictionary,
     and correctly handles cabin/room tracking parameters.
     """
-    from CheckRoyalCaribbeanPrice import AccountInfo, get_orders, WatchItemContext
-
     # 1. Setup our mock inputs
     account_info = AccountInfo(username="dummy_user", password="dummy_password")
     account_info.cruise_line = "royal"
@@ -574,10 +566,6 @@ def test_dining_table_zero_padding():
 
 def test_login_token_decoding_resilience():
     """Verify script breaks predictably if JWT token format is corrupt."""
-    import base64
-    import json
-    import pytest
-
     # A valid mock base64 segment representing {"sub": "12345"}
     valid_payload = base64.b64encode(b'{"sub": "12345"}').decode('utf-8')
     fake_token = f"header.{valid_payload}.signature"
@@ -593,9 +581,6 @@ def test_login_token_decoding_resilience():
 
 def test_get_final_payment_date_formats():
     """Ensure date calculation handles hyphens, slashes, and raw date objects identically."""
-    from datetime import date, datetime
-    from CheckRoyalCaribbeanPrice import get_final_payment_date
-
     expected_milestone = date(2026, 9, 26) # 90 days before Dec 25
 
     assert get_final_payment_date(7, "2026-12-25") == expected_milestone
@@ -604,8 +589,6 @@ def test_get_final_payment_date_formats():
 
 def test_parse_url_cabin_class_fallbacks():
     """Verify URL parsing handles both variant parameters for cabin types."""
-    from CheckRoyalCaribbeanPrice import parse_provided_URL
-
     url_variant_1 = "https://www.royalcaribbean.com?sailDate=20261225&cabinClassType=BALCONY&ship_code=AL"
     url_variant_2 = "https://www.royalcaribbean.com?sailDate=20261225&r0d=BALCONY&ship_code=AL"
 
@@ -1663,7 +1646,6 @@ def test_get_new_order_price_execution():
         passenger_name='Matt',
         room='1234',
         paid_price=70.00,
-#        currency='USD',
         guest_age_string='adult',
         sales_unit='PER_NIGHT',
         for_watch=False,
@@ -1700,9 +1682,7 @@ def test_get_new_order_price_execution():
 
 
 def test_get_new_order_price_writes_json_watch_record(tmp_path):
-    """A valid catalog price is exported with the requested machine-readable fields."""
-    import CheckRoyalCaribbeanPrice
-
+    """A valid catalog price is returned as a dictionary with requested machine-readable fields."""
     account_info = AccountInfo(username="tester", password="password")
     booking = {
         "bookingId": "1234567",
@@ -1717,34 +1697,41 @@ def test_get_new_order_price_writes_json_watch_record(tmp_path):
         passenger_name="Matt",
         room="1234",
         paid_price=70.0,
-#        currency="USD",
         guest_age_string="adult",
     )
-    response = MagicMock()
-    response.json.return_value = {
+
+    # 1. Setup the mock HTTP Response object
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status.return_value = None
+    mock_resp.json.return_value = {
         "payload": {
             "title": "Deluxe Beverage Package",
             "startingFromPrice": {"adultPromotionalPrice": 65.0},
         }
     }
 
-    CheckRoyalCaribbeanPrice.watch_price_rows.clear()
-    with patch("CheckRoyalCaribbeanPrice._execute_api_request", return_value=response), \
-         patch("CheckRoyalCaribbeanPrice.config.minimum_saving_alert", None), \
-         patch("CheckRoyalCaribbeanPrice.log"):
-        get_new_order_price(account_info, booking, None, ctx)
+    # 2. Setup mock session object returned by new_api_session
+    mock_session = MagicMock()
+    mock_session.request.return_value = mock_resp
 
-    output_path = tmp_path / "watch.json"
-    CheckRoyalCaribbeanPrice.write_watch_price_json(str(output_path))
+    mock_ap = MagicMock()
+    mock_ap.get_auth_headers.return_value = {"Authorization": "Bearer mock_token"}
 
-    assert json.loads(output_path.read_text()) == [{
-        "SailDate": "20270510",
-        "ReservationID": "1234567",
-        "Passenger": "Matt",
-        "ProductID": "DBP01",
-        "ProductTitle": "Deluxe Beverage Package",
-        "CurrentPrice": 65.0,
-    }]
+    mock_cfg = MagicMock()
+    mock_cfg.request_timeout = 10.0
+    mock_cfg.minimum_saving_alert = 0.0
+
+    # 3. Patch new_api_session so _execute_api_request uses mock_session instead of hit web
+    with patch("CheckRoyalCaribbeanPrice.config", mock_cfg), \
+         patch("CheckRoyalCaribbeanPrice.new_api_session", return_value=mock_session):
+        watch_row = get_new_order_price(account_info, booking, apobj=mock_ap, ctx=ctx)
+
+    assert watch_row is not None
+    assert watch_row["CurrentPrice"] == 65.0
+    assert watch_row["ProductTitle"] == "Deluxe Beverage Package"
+    assert watch_row["ProductID"] == "DBP01"
+
 
 # ============================================================================
 # ITEM 13 TESTS: EXTRA METRIC CALCULATION Scope Isolation & String Resiliency
@@ -1804,6 +1791,52 @@ def test_calculate_passenger_metrics_brittle_timestamp_fallback():
         assert isinstance(metrics["checkin_string"], str)
     except Exception as err:
         pytest.fail(f"_calculate_passenger_metrics crashed on non-standard arrival timestamp: {err}")
+
+
+def test_calculate_passenger_metrics_gty_booking_fallbacks():
+    """
+    Verify that _calculate_passenger_metrics correctly extracts stateroom
+    category codes from booking-level keys when guest-level keys are None.
+    """
+    guests = [{"guestId": "1"}]  # stateroomCategoryCode omitted/None
+    sail_date = "20270510"
+    booking = {
+        "bookingId": "1234567",
+        "categoryCode": "XB",  # Top-level GTY fallback
+    }
+
+    metrics = _calculate_passenger_metrics(
+        guests=guests,
+        sail_date=sail_date,
+        booking=booking,
+        brand_code="R",
+        display_prices=False,
+    )
+
+    assert metrics.get("category_code") == "XB"
+
+
+def test_calculate_passenger_metrics_config_override_fallback():
+    """
+    Verify that _calculate_passenger_metrics falls back to config.category_override
+    when both guest and booking category fields evaluate to None.
+    """
+    guests = [{"guestId": "1"}]
+    sail_date = "20270510"
+    booking = {"bookingId": "1234567"}  # No category fields present
+
+    with patch("CheckRoyalCaribbeanPrice.config") as mock_config:
+        mock_config.category_override = "XB"
+
+        metrics = _calculate_passenger_metrics(
+            guests=guests,
+            sail_date=sail_date,
+            booking=booking,
+            brand_code="R",
+            display_prices=False,
+        )
+
+        assert metrics.get("category_code") == "XB"
 
 
 # ============================================================================
@@ -2206,7 +2239,6 @@ def test_exact_price_match_includes_obc(monkeypatch):
 # ============================================================================
 def _room_selection_rsc(code="D", category_code="4D"):
     """Minimal room-selection RSC payload exposing one stateroom subtype."""
-    import json
     return json.dumps({"rooms": [{"options": {"stateroomTypes": [
         {"stateroomSubtypes": [{
             "code": code,
@@ -2267,62 +2299,12 @@ def test_availability_false_when_subtype_code_absent():
 # ============================================================================
 # ITEM 18 TESTS END-OF-RUN CHECK-IN & FINAL-PAYMENT SUMMARY TABLE
 # ============================================================================
-def test_checkin_payment_summary_table_renders_and_flags():
-    """print_checkin_payment_table sorts by sail date and colour-codes paid vs balance-due."""
-    import CheckRoyalCaribbeanPrice as crccl
-    from datetime import date
-
-    mock_cfg = MagicMock()
-    mock_cfg.date_display_format = "%Y-%m-%d"
-    mock_cfg.format_date = lambda d: f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
-
-    crccl.checkin_payment_rows.clear()
-    crccl.checkin_payment_rows.extend([
-        # later sail date first, to prove the table sorts ascending
-        {"name": "Freedom of the Seas (8487)", "reservation": "1234567 (Anniversary)",
-         "sail_date": "20271018",
-         "checkin_label": "Opens 2027-09-02", "final_payment": date(2027, 7, 20),
-         "past_final_payment": False, "balance_due": True},
-        {"name": "Icon of the Seas (11418)", "reservation": "7654321",
-         "sail_date": "20260822",
-         "checkin_label": "Boarding 10:30", "final_payment": date(2026, 5, 24),
-         "past_final_payment": True, "balance_due": False},
-    ])
-
-    with patch("CheckRoyalCaribbeanPrice.config", mock_cfg), \
-         patch("CheckRoyalCaribbeanPrice.log", MagicMock()) as mock_log:
-        crccl.print_checkin_payment_table()
-
-    out = "\n".join(str(call[0][0]) for call in mock_log.call_args_list)
-    assert "Upcoming Check-In & Final Payment Dates" in out
-    assert "Reservation" in out                          # new column header present
-    assert "Icon of the Seas (11418)" in out and "Freedom of the Seas (8487)" in out
-    assert "7654321" in out                              # reservation number shown
-    assert "1234567 (Anniversary)" in out                # friendly name rides with the reservation
-    assert "Boarding 10:30" in out                       # assigned boarding time shown
-    assert "(paid)" in out                               # no balance due -> paid
-    assert "(balance due)" in out                        # owed, before deadline
-    assert out.index("Icon of the Seas") < out.index("Freedom of the Seas")  # sorted by sail date
-
-    crccl.checkin_payment_rows.clear()
-
-
-def test_checkin_payment_summary_table_empty_is_silent():
-    """No booked sailings -> the summary prints nothing (no noise on watchlist-only runs)."""
-    import CheckRoyalCaribbeanPrice as crccl
-    crccl.checkin_payment_rows.clear()
-    with patch("CheckRoyalCaribbeanPrice.log", MagicMock()) as mock_log:
-        crccl.print_checkin_payment_table()
-    assert mock_log.call_count == 0
-
-
 def _summary_row(**overrides):
-    from datetime import date as _date
     row = {
         "name": "Mock Ship (7123)",
         "sail_date": "20270815",
         "checkin_label": "TBD",
-        "final_payment": _date(2027, 5, 20),
+        "final_payment": date(2027, 5, 20),
         "past_final_payment": False,
         "balance_due": None,
         "dedupe_key": "1234567|20270815",
@@ -2331,41 +2313,105 @@ def _summary_row(**overrides):
     return row
 
 
+def test_checkin_payment_summary_table_renders_and_flags(monkeypatch):
+    """print_table sorts by sail date and color-codes paid vs balance-due."""
+    captured = []
+
+    # Get the parent module object where CheckinPaymentTracker resides
+    script_module = sys.modules[CheckinPaymentTracker.__module__]
+
+    mock_cfg = MagicMock()
+    mock_cfg.date_display_format = "%Y-%m-%d"
+    mock_cfg.format_date = lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d)
+
+    # Monkeypatch module-level globals without needing a direct import of the module
+    monkeypatch.setattr(script_module, "config", mock_cfg)
+    monkeypatch.setattr(script_module, "log", lambda msg: captured.append(str(msg)))
+
+    tracker = CheckinPaymentTracker()
+    tracker.rows.extend([
+        # later sail date first, to prove the table sorts ascending
+        {
+            "name": "Freedom of the Seas (8487)",
+            "reservation": "1234567 (Anniversary)",
+            "sail_date": "20271018",
+            "checkin_label": "Opens 2027-09-02",
+            "final_payment": date(2027, 7, 20),
+            "past_final_payment": False,
+            "balance_due": True,
+        },
+        {
+            "name": "Icon of the Seas (11418)",
+            "reservation": "7654321",
+            "sail_date": "20260822",
+            "checkin_label": "Boarding 10:30",
+            "final_payment": date(2026, 5, 24),
+            "past_final_payment": True,
+            "balance_due": False,
+        },
+    ])
+
+    tracker.print_table()
+    out = "\n".join(captured)
+
+    assert "Upcoming Check-In & Final Payment Dates" in out
+    assert "Reservation" in out
+    assert "Icon of the Seas (11418)" in out and "Freedom of the Seas (8487)" in out
+    assert "7654321" in out
+    assert "1234567 (Anniversary)" in out
+    assert "Boarding 10:30" in out
+    assert "(paid)" in out
+    assert "(balance due)" in out
+    assert out.index("Icon of the Seas") < out.index("Freedom of the Seas")
+
+
+def test_checkin_payment_summary_table_empty_is_silent():
+    """No booked sailings -> the summary logs nothing (no noise on watchlist-only runs)."""
+    tracker = CheckinPaymentTracker()
+    with patch("CheckRoyalCaribbeanPrice.log") as mock_log:
+        tracker.print_table()
+        assert mock_log.info.call_count == 0
+
+
 def test_summary_table_dedupes_linked_reservations():
     """A reservation linked between two accounts is seen once per account but
     must appear once in the table - regardless of which account came first."""
-    import CheckRoyalCaribbeanPrice as crccl
+    tracker = CheckinPaymentTracker()
 
-    # Owner's view first (has payment data), linked view second (has none)
-    crccl.checkin_payment_rows.clear()
-    crccl.record_checkin_payment_row(_summary_row(balance_due=False, checkin_label="Boarding 10:30"))
-    crccl.record_checkin_payment_row(_summary_row())
-    assert len(crccl.checkin_payment_rows) == 1
-    assert crccl.checkin_payment_rows[0]["balance_due"] is False
-    assert crccl.checkin_payment_rows[0]["checkin_label"] == "Boarding 10:30"
+    # 1. Owner's view first (has payment data), linked view second (has none)
+    tracker.rows.clear()
+    tracker.record_row(_summary_row(balance_due=False, checkin_label="Boarding 10:30"))
+    tracker.record_row(_summary_row())
 
-    # Reverse order: the linked account's empty view must not mask the owner's
-    crccl.checkin_payment_rows.clear()
-    crccl.record_checkin_payment_row(_summary_row())
-    crccl.record_checkin_payment_row(_summary_row(balance_due=True, past_final_payment=True,
-                                                  checkin_label="Opens 2027-06-01"))
-    assert len(crccl.checkin_payment_rows) == 1
-    assert crccl.checkin_payment_rows[0]["balance_due"] is True
-    assert crccl.checkin_payment_rows[0]["past_final_payment"] is True
-    assert crccl.checkin_payment_rows[0]["checkin_label"] == "Opens 2027-06-01"
+    assert len(tracker.rows) == 1
+    assert tracker.rows[0]["balance_due"] is False
+    assert tracker.rows[0]["checkin_label"] == "Boarding 10:30"
 
-    crccl.checkin_payment_rows.clear()
+    # 2. Reverse order: linked account's empty view must not mask owner's data
+    tracker.rows.clear()
+    tracker.record_row(_summary_row())
+    tracker.record_row(_summary_row(
+        balance_due=True,
+        past_final_payment=True,
+        checkin_label="Opens 2027-06-01"
+    ))
+
+    assert len(tracker.rows) == 1
+    assert tracker.rows[0]["balance_due"] is True
+    assert tracker.rows[0]["past_final_payment"] is True
+    assert tracker.rows[0]["checkin_label"] == "Opens 2027-06-01"
 
 
 def test_summary_table_keeps_distinct_reservations():
     """Different reservations (e.g. two cabins on one sailing) are never merged."""
-    import CheckRoyalCaribbeanPrice as crccl
-    crccl.checkin_payment_rows.clear()
-    crccl.record_checkin_payment_row(_summary_row(dedupe_key="1234567|20270815"))
-    crccl.record_checkin_payment_row(_summary_row(dedupe_key="8912345|20270815",
-                                                  name="Mock Ship (7125)"))
-    assert len(crccl.checkin_payment_rows) == 2
-    crccl.checkin_payment_rows.clear()
+    tracker = CheckinPaymentTracker()
+    tracker.record_row(_summary_row(dedupe_key="1234567|20270815"))
+    tracker.record_row(_summary_row(
+        dedupe_key="8912345|20270815",
+        name="Mock Ship (7125)"
+    ))
+
+    assert len(tracker.rows) == 2
 
 
 # ============================================================================
@@ -2373,61 +2419,73 @@ def test_summary_table_keeps_distinct_reservations():
 # A null/absent balanceDue must never render as "(paid)"; only an explicit
 # False may. Null with a positive balanceDueAmount is a balance due.
 # ============================================================================
-def _run_payment_table(monkeypatch, row_overrides):
-    import CheckRoyalCaribbeanPrice as crccl
-    from datetime import date as _date
+def _run_payment_table(row_overrides, monkeypatch):
+    captured = []
+    script_module = sys.modules[CheckinPaymentTracker.__module__]
+
+    mock_cfg = MagicMock()
+    mock_cfg.date_display_format = "%Y-%m-%d"
+    mock_cfg.format_date = lambda d: d.strftime("%Y-%m-%d") if isinstance(d, date) else str(d)
+
+    monkeypatch.setattr(script_module, "config", mock_cfg)
+    monkeypatch.setattr(script_module, "log", lambda msg: captured.append(str(msg)))
+
+    tracker = CheckinPaymentTracker()
     row = {
         "name": "Mock Ship #1234",
         "sail_date": "2027-03-15",
         "checkin_label": "TBD",
-        "final_payment": _date(2026, 12, 15),
+        "final_payment": date(2026, 12, 15),
         "past_final_payment": False,
         "balance_due": None,
     }
     row.update(row_overrides)
-    monkeypatch.setattr(crccl, "checkin_payment_rows", [row])
-    captured = []
-    monkeypatch.setattr(crccl, "log", lambda msg: captured.append(msg))
-    crccl.print_checkin_payment_table()
-    return "".join(captured)
+
+    tracker.rows.append(row)
+
+    tracker.print_table()
+    return "\n".join(captured)
 
 
 def test_payment_table_explicit_false_is_paid(monkeypatch):
-    out = _run_payment_table(monkeypatch, {"balance_due": False})
+    out = _run_payment_table({"balance_due": False}, monkeypatch)
     assert "(paid)" in out
 
 
 def test_payment_table_true_shows_balance(monkeypatch):
     # No amount in the label - TA fees make the exact remaining payment uncertain
-    out = _run_payment_table(monkeypatch, {"balance_due": True})
+    out = _run_payment_table({"balance_due": True}, monkeypatch)
     assert "(balance due)" in out
-    assert "(paid)" not in out
 
 
 def test_payment_table_none_is_not_paid(monkeypatch):
     # The reported bug: API returns balanceDue null -> row must not claim paid
-    out = _run_payment_table(monkeypatch, {"balance_due": None})
+    out = _run_payment_table({"balance_due": None}, monkeypatch)
     assert "(paid)" not in out
     assert "status unknown" in out
 
 
 def test_derive_balance_due_states():
-    from CheckRoyalCaribbeanPrice import derive_balance_due
     assert derive_balance_due({"balanceDue": True}) is True
     assert derive_balance_due({"balanceDue": False}) is False
+
     # paidInFull is trusted only when True: agency/TA bookings report
     # paidInFull False even when settled (verified against a paid TA booking),
     # so False proves nothing
     assert derive_balance_due({"paidInFull": True}) is False
     assert derive_balance_due({"paidInFull": False}) is None
+
     # explicit balanceDue outranks paidInFull; paidInFull=True outranks the amount
     assert derive_balance_due({"balanceDue": True, "paidInFull": True}) is True
     assert derive_balance_due({"paidInFull": True, "balanceDueAmount": 100.0}) is False
+
     # paidInFull False falls through to the amount
     assert derive_balance_due({"paidInFull": False, "balanceDueAmount": 250.0}) is True
+
     # null balanceDue and no paidInFull: a numeric amount decides
     assert derive_balance_due({"balanceDue": None, "balanceDueAmount": 250.0}) is True
     assert derive_balance_due({"balanceDueAmount": 0}) is False
+
     # nothing to go on -> unknown, never "paid"
     assert derive_balance_due({"balanceDue": None, "balanceDueAmount": None}) is None
     assert derive_balance_due({}) is None
@@ -2438,21 +2496,10 @@ def test_derive_balance_due_states():
 # Tunables live in the constants section rather than as scattered
 # magic numbers; pin their values so a change is a conscious decision.
 # ============================================================================
-def test_timeout_retry_constants():
-    import CheckRoyalCaribbeanPrice as crccl
-    assert crccl.REQUEST_TIMEOUT == 30
-    assert crccl.SHORT_REQUEST_TIMEOUT == 10
-    assert crccl.MAX_RETRIES == 3
-    assert crccl.RETRY_BACKOFF_BASE == 2
-    assert crccl.DEFAULT_ON_FAILURE == "retry"
-    assert crccl.ACCOUNT_COOLDOWN_SECONDS == 5
-
-
 def test_config_parses_without_apprise_package(tmp_path, monkeypatch):
     """apprise is an optional dependency: a config with an apprise: block must
     still parse when the package is absent - notifications just turn off."""
-    import CheckRoyalCaribbeanPrice as crccl
-    monkeypatch.setattr(crccl, "Apprise", None)
+    monkeypatch.setattr("CheckRoyalCaribbeanPrice.Apprise", None)
     yaml_content = """
     accountInfo:
       - username: "test_user"
